@@ -60,6 +60,7 @@ export class DeploymentPanel {
     this.panel.title = `Vercel: ${deployment.name}`;
 
     let logs: BuildLog[] = [];
+    let logError: string | undefined;
 
     // Fetch build logs for terminal states or errors
     if (
@@ -68,13 +69,13 @@ export class DeploymentPanel {
       deployment.state === 'BUILDING'
     ) {
       try {
-        logs = await getBuildLogs(this.token, deployment.uid, this.teamId);
-      } catch {
-        // Logs may not yet be available, proceed without them
+        logs = await getBuildLogs(this.token, deployment.uid, deployment.url, this.teamId);
+      } catch (err) {
+        logError = err instanceof Error ? err.message : String(err);
       }
     }
 
-    this.panel.webview.html = this.buildHtml(deployment, logs);
+    this.panel.webview.html = this.buildHtml(deployment, logs, logError);
   }
 
   public dispose(): void {
@@ -85,7 +86,7 @@ export class DeploymentPanel {
     }
   }
 
-  private buildHtml(deployment: VercelDeployment, logs: BuildLog[]): string {
+  private buildHtml(deployment: VercelDeployment, logs: BuildLog[], logError?: string): string {
     const env = deployment.target === 'production' ? 'Production' : 'Preview';
     const stateColor = getStateColor(deployment.state);
     const stateLabel = getStateLabel(deployment.state);
@@ -119,6 +120,10 @@ export class DeploymentPanel {
         return `<div class="log-line ${logClass}">${escaped}</div>`;
       })
       .join('');
+
+    const logContent = logError
+      ? `<span class="no-logs log-error">Error fetching logs: ${escapeHtml(logError)}</span>`
+      : logLines || `<span class="no-logs">No logs available yet. (deployment uid: ${escapeHtml(deployment.uid)}, state: ${deployment.state})</span>`;
 
     const deployUrl = `https://${deployment.url}`;
 
@@ -239,7 +244,7 @@ export class DeploymentPanel {
 
   <h2>Build Logs</h2>
   <div class="logs">
-    ${logLines || '<span class="no-logs">No logs available yet.</span>'}
+    ${logContent}
   </div>
 
   <br/>

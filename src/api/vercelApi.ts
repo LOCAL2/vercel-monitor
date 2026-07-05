@@ -122,11 +122,29 @@ export async function getDeployment(
 
 /**
  * Fetch build logs for a deployment.
- * Uses /v3 which returns newline-delimited JSON objects.
+ * Uses /v3 which accepts either deployment ID (dpl_xxx) or hostname URL.
  */
 export async function getBuildLogs(
   token: string,
   deploymentId: string,
+  deploymentUrl: string,
+  teamId?: string
+): Promise<BuildLog[]> {
+  // Try uid first; if 404, fall back to the hostname (url field)
+  try {
+    return await fetchBuildLogsById(token, deploymentId, teamId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('404') || msg.includes('not_found')) {
+      return fetchBuildLogsById(token, deploymentUrl, teamId);
+    }
+    throw err;
+  }
+}
+
+async function fetchBuildLogsById(
+  token: string,
+  idOrUrl: string,
   teamId?: string
 ): Promise<BuildLog[]> {
   const query = new URLSearchParams({ direction: 'forward', builds: '1' });
@@ -135,7 +153,7 @@ export async function getBuildLogs(
   return new Promise((resolve, reject) => {
     const options = {
       hostname: BASE_URL,
-      path: `/v3/deployments/${deploymentId}/events?${query.toString()}`,
+      path: `/v3/deployments/${encodeURIComponent(idOrUrl)}/events?${query.toString()}`,
       method: 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -147,9 +165,19 @@ export async function getBuildLogs(
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+          return;
+        }
+
         try {
-          // v3 returns newline-delimited JSON (NDJSON)
           const lines = data.split('\n').filter((l) => l.trim());
+
+          if (lines.length === 0) {
+            reject(new Error(`Empty response (uid: ${idOrUrl})`));
+            return;
+          }
+
           const logs: BuildLog[] = [];
 
           for (const line of lines) {
@@ -157,32 +185,31 @@ export async function getBuildLogs(
               const event = JSON.parse(line) as {
                 type?: string;
                 created?: number;
-                // v3 wraps log text inside payload
-                payload?: {
-                  text?: string;
-                  type?: string;
-                };
-                // some events have text at top level
+                payload?: { text?: string; type?: string };
                 text?: string;
               };
 
-              // Skip delimiter / non-log events
               if (!event || event.type === 'delimiter') { continue; }
 
               const text = event.payload?.text ?? event.text ?? '';
               if (!text.trim()) { continue; }
 
               const logType = (event.payload?.type ?? event.type ?? 'stdout') as BuildLog['type'];
-
               logs.push({ text, type: logType, created: event.created ?? 0 });
             } catch {
               // skip malformed line
             }
           }
 
+          if (logs.length === 0) {
+            const sample = lines.slice(0, 3).join(' | ').slice(0, 500);
+            reject(new Error(`Parsed 0 logs from ${lines.length} lines. Sample: ${sample}`));
+            return;
+          }
+
           resolve(logs);
         } catch (err) {
-          reject(new Error(`Failed to parse build log response: ${String(err)}`));
+          reject(new Error(`Parse error: ${String(err)}\nRaw: ${data.slice(0, 300)}`));
         }
       });
     });
