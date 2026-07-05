@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+
+# Packaged extension
+*.vsix
+
+# VS Code settings (optional — remove if you want to share these)
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+
+# OS
+.DS_Store
+Thumbs.db
