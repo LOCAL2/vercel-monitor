@@ -2,8 +2,9 @@ import * as vscode from 'vscode';
 import { getDeployment, getLatestDeployment } from '../api/vercelApi';
 import { DeploymentState, VercelDeployment, VercelProject } from '../types';
 
-const POLL_INTERVAL_MS = 5000; // 5 seconds while active
-const IDLE_INTERVAL_MS = 30000; // 30 seconds when idle
+// Poll every 5s while building, 10s when idle (fast enough to catch new deploys)
+const ACTIVE_INTERVAL_MS = 5000;
+const IDLE_INTERVAL_MS = 10000;
 
 export type PollerEventType = 'update' | 'error' | 'completed' | 'failed';
 
@@ -16,6 +17,7 @@ export interface PollerEvent {
 export class DeploymentPoller {
   private timer: NodeJS.Timeout | undefined;
   private currentDeploymentId: string | undefined;
+  private currentState: DeploymentState | undefined;
   private isActive = false;
   private token: string;
   private project: VercelProject;
@@ -32,6 +34,7 @@ export class DeploymentPoller {
     if (this.timer) {
       return;
     }
+    // Poll immediately on start
     this.poll();
   }
 
@@ -46,7 +49,9 @@ export class DeploymentPoller {
   public updateCredentials(token: string, project: VercelProject): void {
     this.token = token;
     this.project = project;
+    // Reset so next poll treats everything as new
     this.currentDeploymentId = undefined;
+    this.currentState = undefined;
   }
 
   public dispose(): void {
@@ -55,7 +60,7 @@ export class DeploymentPoller {
   }
 
   private scheduleNext(): void {
-    const interval = this.isActive ? POLL_INTERVAL_MS : IDLE_INTERVAL_MS;
+    const interval = this.isActive ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
     this.timer = setTimeout(() => this.poll(), interval);
   }
 
@@ -63,6 +68,7 @@ export class DeploymentPoller {
     this.timer = undefined;
 
     try {
+      // Step 1: quick list call to check latest uid + state cheaply
       const latest = await getLatestDeployment(
         this.token,
         this.project.projectId,
@@ -75,36 +81,46 @@ export class DeploymentPoller {
         return;
       }
 
-      // If same deployment and it's already in a terminal state, go idle
-      if (
-        latest.uid === this.currentDeploymentId &&
-        isTerminalState(latest.state)
-      ) {
+      const isNewDeployment = latest.uid !== this.currentDeploymentId;
+      const stateChanged = latest.state !== this.currentState;
+      const isFirstPoll = this.currentDeploymentId === undefined;
+
+      // Nothing changed and already in terminal state → stay idle
+      // (but always fetch on first poll so lastDeployment gets populated)
+      if (!isFirstPoll && !isNewDeployment && !stateChanged && isTerminalState(latest.state)) {
         this.isActive = false;
         this.scheduleNext();
         return;
       }
 
-      // New deployment detected or state changed
-      const isNewDeployment = latest.uid !== this.currentDeploymentId;
-      this.currentDeploymentId = latest.uid;
+      // First poll, new deployment, or state changed — fetch full details
+      if (isFirstPoll || isNewDeployment || stateChanged) {
+        this.currentDeploymentId = latest.uid;
+        this.currentState = latest.state;
+        this.isActive = !isTerminalState(latest.state);
 
-      // Fetch full details
-      const deployment = await getDeployment(
-        this.token,
-        latest.uid,
-        this.project.orgId || undefined
-      );
+        // Fetch full deployment for logs + complete metadata
+        const deployment = await getDeployment(
+          this.token,
+          latest.uid,
+          this.project.orgId || undefined
+        );
 
-      this.isActive = !isTerminalState(deployment.state);
+        // Use the more accurate state from the detail endpoint
+        this.currentState = deployment.state;
+        this.isActive = !isTerminalState(deployment.state);
 
-      if (isTerminalState(deployment.state)) {
-        const eventType = deployment.state === 'READY' ? 'completed' : 'failed';
-        this._onEvent.fire({ type: eventType, deployment });
-      } else if (isNewDeployment) {
-        this._onEvent.fire({ type: 'update', deployment });
+        if (deployment.state === 'READY') {
+          this._onEvent.fire({ type: 'completed', deployment });
+        } else if (isTerminalState(deployment.state)) {
+          this._onEvent.fire({ type: 'failed', deployment });
+        } else {
+          // QUEUED, INITIALIZING, BUILDING — fire update for status bar
+          this._onEvent.fire({ type: 'update', deployment });
+        }
       } else {
-        this._onEvent.fire({ type: 'update', deployment });
+        // Same deployment, non-terminal, no state change — still active, keep polling fast
+        this.isActive = true;
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

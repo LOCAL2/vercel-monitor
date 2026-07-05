@@ -1,7 +1,50 @@
 import * as https from 'https';
-import { BuildLog, VercelDeployment } from '../types';
+import { BuildLog, DeploymentState, VercelDeployment } from '../types';
 
 const BASE_URL = 'api.vercel.com';
+
+// Raw shape from Vercel API — state field name differs by endpoint
+interface RawDeployment {
+  uid: string;
+  name: string;
+  url: string;
+  state?: string;         // from /v6/deployments list
+  readyState?: string;    // from /v13/deployments/:id
+  target: 'production' | 'staging' | null;
+  meta?: {
+    githubCommitSha?: string;
+    githubCommitMessage?: string;
+    githubCommitRef?: string;
+    githubCommitAuthorName?: string;
+  };
+  createdAt: number;
+  buildingAt?: number;
+  ready?: number;
+}
+
+const VALID_STATES: DeploymentState[] = [
+  'QUEUED', 'BUILDING', 'READY', 'ERROR', 'CANCELED', 'INITIALIZING',
+];
+
+function normalizeDeployment(raw: RawDeployment): VercelDeployment {
+  // /v13 uses readyState, /v6 uses state — normalise to uppercase
+  const rawState = (raw.readyState ?? raw.state ?? '').toUpperCase();
+  const state: DeploymentState = (VALID_STATES.includes(rawState as DeploymentState)
+    ? rawState
+    : 'QUEUED') as DeploymentState;
+
+  return {
+    uid: raw.uid,
+    name: raw.name,
+    url: raw.url,
+    state,
+    target: raw.target,
+    meta: raw.meta ?? {},
+    createdAt: raw.createdAt,
+    buildingAt: raw.buildingAt,
+    ready: raw.ready,
+  };
+}
 
 function httpsGet(path: string, token: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -37,9 +80,6 @@ function httpsGet(path: string, token: string): Promise<unknown> {
 
 /**
  * Fetch the latest deployment for a given project.
- * @param token Vercel API token
- * @param projectId Vercel project ID
- * @param teamId Vercel org/team ID (optional)
  */
 export async function getLatestDeployment(
   token: string,
@@ -48,7 +88,7 @@ export async function getLatestDeployment(
 ): Promise<VercelDeployment | null> {
   const query = teamId ? `?projectId=${projectId}&teamId=${teamId}&limit=1` : `?projectId=${projectId}&limit=1`;
   const result = (await httpsGet(`/v6/deployments${query}`, token)) as {
-    deployments?: VercelDeployment[];
+    deployments?: RawDeployment[];
     error?: { message: string };
   };
 
@@ -56,7 +96,8 @@ export async function getLatestDeployment(
     throw new Error(result.error.message);
   }
 
-  return result.deployments?.[0] ?? null;
+  const raw = result.deployments?.[0];
+  return raw ? normalizeDeployment(raw) : null;
 }
 
 /**
@@ -69,14 +110,14 @@ export async function getDeployment(
 ): Promise<VercelDeployment> {
   const query = teamId ? `?teamId=${teamId}` : '';
   const result = (await httpsGet(`/v13/deployments/${deploymentId}${query}`, token)) as
-    | VercelDeployment
+    | RawDeployment
     | { error: { message: string } };
 
-  if ('error' in result) {
+  if ('error' in result && (result as { error: { message: string } }).error) {
     throw new Error((result as { error: { message: string } }).error.message);
   }
 
-  return result as VercelDeployment;
+  return normalizeDeployment(result as RawDeployment);
 }
 
 /**

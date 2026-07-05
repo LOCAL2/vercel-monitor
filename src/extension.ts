@@ -3,7 +3,7 @@ import { DeploymentPoller } from './services/deploymentPoller';
 import { detectVercelProject, watchProjectFile } from './services/projectDetector';
 import { VercelStatusBar } from './ui/statusBar';
 import { DeploymentPanel } from './ui/deploymentPanel';
-import { findProjectByName, listProjects, validateToken } from './api/vercelApi';
+import { findProjectByName, getDeployment, getLatestDeployment, listProjects, validateToken } from './api/vercelApi';
 import { VercelProject } from './types';
 
 const TOKEN_SECRET_KEY = 'vercel-monitor.token';
@@ -12,6 +12,7 @@ const PROJECT_STATE_KEY = 'vercel-monitor.project';
 let poller: DeploymentPoller | undefined;
 let statusBar: VercelStatusBar | undefined;
 let currentProject: VercelProject | undefined;
+let lastDeployment: import('./types').VercelDeployment | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   statusBar = new VercelStatusBar();
@@ -38,7 +39,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         return;
       }
-      DeploymentPanel.createOrShow(context.extensionUri, token, currentProject.orgId);
+      await openPanel(context);
     })
   );
 
@@ -160,6 +161,7 @@ async function initPoller(context: vscode.ExtensionContext): Promise<void> {
     switch (event.type) {
       case 'update':
         if (event.deployment) {
+          lastDeployment = event.deployment;
           statusBar?.update(event.deployment);
           if (DeploymentPanel.currentPanel) {
             await DeploymentPanel.currentPanel.update(event.deployment);
@@ -169,12 +171,13 @@ async function initPoller(context: vscode.ExtensionContext): Promise<void> {
 
       case 'completed':
         if (event.deployment) {
+          lastDeployment = event.deployment;
           statusBar?.update(event.deployment);
 
           const env = event.deployment.target === 'production' ? 'Production' : 'Preview';
           const commitMsg = event.deployment.meta?.githubCommitMessage?.split('\n')[0] ?? '';
           const durationStr = getDurationStr(event.deployment);
-          const msg = `✅ Vercel Deploy Ready — ${event.deployment.name} (${env})${commitMsg ? ': ' + commitMsg : ''}${durationStr ? ' · ' + durationStr : ''}`;
+          const msg = `Vercel Deploy Ready — ${event.deployment.name} (${env})${commitMsg ? ': ' + commitMsg : ''}${durationStr ? ' · ' + durationStr : ''}`;
 
           const action = await vscode.window.showInformationMessage(
             msg,
@@ -192,10 +195,11 @@ async function initPoller(context: vscode.ExtensionContext): Promise<void> {
 
       case 'failed':
         if (event.deployment) {
+          lastDeployment = event.deployment;
           statusBar?.update(event.deployment);
 
           const action = await vscode.window.showErrorMessage(
-            `❌ Vercel Deploy Failed — ${event.deployment.name}`,
+            `Vercel Deploy Failed — ${event.deployment.name}`,
             'View Build Logs'
           );
 
@@ -324,7 +328,21 @@ async function openPanel(context: vscode.ExtensionContext): Promise<void> {
   if (!token || !currentProject) {
     return;
   }
-  DeploymentPanel.createOrShow(context.extensionUri, token, currentProject.orgId);
+  const panel = DeploymentPanel.createOrShow(context.extensionUri, token, currentProject.orgId);
+
+  // Use cached deployment if available, otherwise fetch fresh from API
+  const deployment = lastDeployment ?? await getLatestDeployment(token, currentProject.projectId, currentProject.orgId || undefined).catch(() => undefined);
+  if (deployment) {
+    lastDeployment = deployment;
+    // Fetch full details (includes logs) when opening
+    try {
+      const full = await getDeployment(token, deployment.uid, currentProject.orgId || undefined);
+      lastDeployment = full;
+      await panel.update(full);
+    } catch {
+      await panel.update(deployment);
+    }
+  }
 }
 
 async function runSetupWizard(context: vscode.ExtensionContext): Promise<void> {
@@ -362,7 +380,7 @@ async function runSetupWizard(context: vscode.ExtensionContext): Promise<void> {
         poller?.stop();
         poller = undefined;
         vscode.window.showInformationMessage(
-          `✅ Vercel Monitor: Authenticated as ${username}. Linking project…`
+          `Vercel Monitor: Authenticated as ${username}. Linking project…`
         );
         await initPoller(context);
       } catch (err) {

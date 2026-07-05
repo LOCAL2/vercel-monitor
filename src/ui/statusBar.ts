@@ -5,7 +5,7 @@ const STATE_ICONS: Record<DeploymentState, string> = {
   QUEUED: '$(clock)',
   INITIALIZING: '$(sync~spin)',
   BUILDING: '$(loading~spin)',
-  READY: '$(check)',
+  READY: '$(cloud)',
   ERROR: '$(error)',
   CANCELED: '$(circle-slash)',
 };
@@ -51,7 +51,18 @@ export class VercelStatusBar {
     const label = STATE_LABELS[deployment.state] ?? deployment.state;
     const env = deployment.target === 'production' ? 'Production' : 'Preview';
 
-    this.item.text = `${icon} Vercel: ${label}`;
+    const branch = deployment.meta?.githubCommitRef;
+    const duration =
+      deployment.ready && deployment.createdAt
+        ? formatDuration(Math.round((deployment.ready - deployment.createdAt) / 1000))
+        : undefined;
+
+    // e.g. "$(check) Vercel: Ready · main · 1m 23s"
+    const parts = [`${icon} Vercel: ${label}`];
+    if (branch) { parts.push(branch); }
+    if (duration && isTerminalState(deployment.state)) { parts.push(duration); }
+
+    this.item.text = parts.join(' · ');
     this.item.tooltip = buildTooltip(deployment, env);
 
     if (deployment.state === 'READY') {
@@ -106,6 +117,10 @@ function buildTooltip(deployment: VercelDeployment, env: string): string {
 
   lines.push('', 'Click to open deployment panel');
   return lines.join('\n');
+}
+
+function isTerminalState(state: DeploymentState): boolean {
+  return state === 'READY' || state === 'ERROR' || state === 'CANCELED';
 }
 
 function formatDuration(seconds: number): string {
