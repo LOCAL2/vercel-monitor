@@ -3,8 +3,8 @@ import { getDeployment, getLatestDeployment } from '../api/vercelApi';
 import { DeploymentState, VercelDeployment, VercelProject } from '../types';
 
 // Poll every 5s while building, 10s when idle (fast enough to catch new deploys)
-const ACTIVE_INTERVAL_MS = 5000;
-const IDLE_INTERVAL_MS = 10000;
+const ACTIVE_INTERVAL_MS = 5_000;
+const IDLE_INTERVAL_MS = 10_000;
 
 export type PollerEventType = 'update' | 'error' | 'completed' | 'failed';
 
