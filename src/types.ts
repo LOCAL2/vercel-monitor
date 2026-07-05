@@ -31,6 +31,6 @@ export interface VercelDeployment {
 
 export interface BuildLog {
   text: string;
-  type: 'command' | 'stdout' | 'stderr' | 'exit' | 'error' | 'warn' | 'info';
+  type: 'command' | 'stdout' | 'stderr' | 'exit' | 'error' | 'warn' | 'info' | 'delimiter';
   created: number;
 }

@@ -122,25 +122,77 @@ export async function getDeployment(
 
 /**
  * Fetch build logs for a deployment.
+ * Uses /v3 which returns newline-delimited JSON objects.
  */
 export async function getBuildLogs(
   token: string,
   deploymentId: string,
   teamId?: string
 ): Promise<BuildLog[]> {
-  const query = teamId ? `?teamId=${teamId}&direction=forward` : '?direction=forward';
-  const result = (await httpsGet(`/v2/deployments/${deploymentId}/events${query}`, token)) as
-    | BuildLog[]
-    | { error: { message: string } };
+  const query = new URLSearchParams({ direction: 'forward', builds: '1' });
+  if (teamId) { query.set('teamId', teamId); }
 
-  if (!Array.isArray(result)) {
-    if ('error' in result) {
-      throw new Error((result as { error: { message: string } }).error.message);
-    }
-    return [];
-  }
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: BASE_URL,
+      path: `/v3/deployments/${deploymentId}/events?${query.toString()}`,
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    };
 
-  return result;
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          // v3 returns newline-delimited JSON (NDJSON)
+          const lines = data.split('\n').filter((l) => l.trim());
+          const logs: BuildLog[] = [];
+
+          for (const line of lines) {
+            try {
+              const event = JSON.parse(line) as {
+                type?: string;
+                created?: number;
+                // v3 wraps log text inside payload
+                payload?: {
+                  text?: string;
+                  type?: string;
+                };
+                // some events have text at top level
+                text?: string;
+              };
+
+              // Skip delimiter / non-log events
+              if (!event || event.type === 'delimiter') { continue; }
+
+              const text = event.payload?.text ?? event.text ?? '';
+              if (!text.trim()) { continue; }
+
+              const logType = (event.payload?.type ?? event.type ?? 'stdout') as BuildLog['type'];
+
+              logs.push({ text, type: logType, created: event.created ?? 0 });
+            } catch {
+              // skip malformed line
+            }
+          }
+
+          resolve(logs);
+        } catch (err) {
+          reject(new Error(`Failed to parse build log response: ${String(err)}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('Build log request timed out'));
+    });
+    req.end();
+  });
 }
 
 /**
