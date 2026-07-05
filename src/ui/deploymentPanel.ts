@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { getBuildLogs } from '../api/vercelApi';
-import { BuildLog, VercelDeployment } from '../types';
+import { streamBuildLogs } from '../api/vercelApi';
+import { VercelDeployment } from '../types';
 
 export class DeploymentPanel {
   public static currentPanel: DeploymentPanel | undefined;
@@ -12,6 +12,7 @@ export class DeploymentPanel {
   private currentDeployment: VercelDeployment | undefined;
   private token: string;
   private teamId: string | undefined;
+  private streamAbort: (() => void) | undefined;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -56,29 +57,52 @@ export class DeploymentPanel {
   }
 
   public async update(deployment: VercelDeployment): Promise<void> {
+    // Cancel any in-progress stream from a previous deployment
+    this.streamAbort?.();
+    this.streamAbort = undefined;
+
     this.currentDeployment = deployment;
     this.panel.title = `Vercel: ${deployment.name}`;
 
-    let logs: BuildLog[] = [];
-    let logError: string | undefined;
+    // Render the shell HTML first (logs container is empty / shows spinner)
+    this.panel.webview.html = this.buildHtml(deployment);
 
-    // Fetch build logs for terminal states or errors
+    // Only stream logs for states that have build output
     if (
       deployment.state === 'READY' ||
       deployment.state === 'ERROR' ||
       deployment.state === 'BUILDING'
     ) {
+      let aborted = false;
+      this.streamAbort = () => { aborted = true; };
+
       try {
-        logs = await getBuildLogs(this.token, deployment.uid, deployment.url, this.teamId);
-      } catch (err) {
-        logError = err instanceof Error ? err.message : String(err);
+        await streamBuildLogs(
+          this.token,
+          deployment.uid,
+          deployment.url,
+          this.teamId,
+          (line) => {
+            if (aborted || !this.panel) { return; }
+            this.panel.webview.postMessage({ type: 'log', text: line.text, logType: line.logType });
+          },
+          () => {
+            if (aborted || !this.panel) { return; }
+            this.panel.webview.postMessage({ type: 'done' });
+          },
+          (err) => {
+            if (aborted || !this.panel) { return; }
+            this.panel.webview.postMessage({ type: 'error', text: err });
+          }
+        );
+      } catch {
+        // stream errors are already forwarded via onError callback
       }
     }
-
-    this.panel.webview.html = this.buildHtml(deployment, logs, logError);
   }
 
   public dispose(): void {
+    this.streamAbort?.();
     DeploymentPanel.currentPanel = undefined;
     this.panel.dispose();
     for (const d of this.disposables) {
@@ -86,7 +110,7 @@ export class DeploymentPanel {
     }
   }
 
-  private buildHtml(deployment: VercelDeployment, logs: BuildLog[], logError?: string): string {
+  private buildHtml(deployment: VercelDeployment): string {
     const env = deployment.target === 'production' ? 'Production' : 'Preview';
     const stateColor = getStateColor(deployment.state);
     const stateLabel = getStateLabel(deployment.state);
@@ -111,20 +135,6 @@ export class DeploymentPanel {
       : '—';
     const branch = deployment.meta?.githubCommitRef ?? '—';
     const author = deployment.meta?.githubCommitAuthorName ?? '—';
-
-    const logLines = logs
-      .filter((l) => l.text?.trim())
-      .map((l) => {
-        const logClass = l.type === 'stderr' || l.type === 'error' ? 'log-error' : 'log-normal';
-        const escaped = escapeHtml(l.text);
-        return `<div class="log-line ${logClass}">${escaped}</div>`;
-      })
-      .join('');
-
-    const logContent = logError
-      ? `<span class="no-logs log-error">Error fetching logs: ${escapeHtml(logError)}</span>`
-      : logLines || `<span class="no-logs">No logs available yet. (deployment uid: ${escapeHtml(deployment.uid)}, state: ${deployment.state})</span>`;
-
     const deployUrl = `https://${deployment.url}`;
 
     return `<!DOCTYPE html>
@@ -134,9 +144,7 @@ export class DeploymentPanel {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Vercel Deployment</title>
   <style>
-    :root {
-      --radius: 6px;
-    }
+    :root { --radius: 6px; }
     body {
       font-family: var(--vscode-font-family, system-ui, sans-serif);
       font-size: var(--vscode-font-size, 13px);
@@ -181,7 +189,7 @@ export class DeploymentPanel {
     .log-line { line-height: 1.5; }
     .log-error { color: #f48771; }
     .log-normal { color: var(--vscode-terminal-foreground, #d4d4d4); }
-    .no-logs { color: var(--vscode-descriptionForeground); font-style: italic; }
+    .log-status { color: var(--vscode-descriptionForeground); font-style: italic; }
     .header { display: flex; align-items: center; gap: 12px; padding: 20px 0 12px; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 8px; }
     .open-btn {
       display: inline-block;
@@ -193,10 +201,9 @@ export class DeploymentPanel {
       text-decoration: none;
       font-size: .9em;
     }
-    .open-btn:hover {
-      background: var(--vscode-button-hoverBackground);
-      text-decoration: none;
-    }
+    .open-btn:hover { background: var(--vscode-button-hoverBackground); text-decoration: none; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .cursor { display: inline-block; width: 7px; height: 1em; background: currentColor; vertical-align: text-bottom; animation: blink 1s step-end infinite; margin-left: 2px; }
   </style>
 </head>
 <body>
@@ -210,19 +217,14 @@ export class DeploymentPanel {
   <div class="grid">
     <span class="label">URL</span>
     <span class="value"><a href="${deployUrl}" target="_blank">${escapeHtml(deployment.url)}</a></span>
-
     <span class="label">State</span>
     <span class="value">${stateLabel}</span>
-
     <span class="label">Environment</span>
     <span class="value">${env}</span>
-
     <span class="label">Created</span>
     <span class="value">${createdAt}</span>
-
     <span class="label">Completed</span>
     <span class="value">${readyAt}</span>
-
     <span class="label">Duration</span>
     <span class="value">${durationStr}</span>
   </div>
@@ -231,24 +233,70 @@ export class DeploymentPanel {
   <div class="grid">
     <span class="label">Branch</span>
     <span class="value">${escapeHtml(branch)}</span>
-
     <span class="label">Commit</span>
     <span class="value">${escapeHtml(commitSha)}</span>
-
     <span class="label">Message</span>
     <span class="value">${escapeHtml(commitMsg)}</span>
-
     <span class="label">Author</span>
     <span class="value">${escapeHtml(author)}</span>
   </div>
 
   <h2>Build Logs</h2>
-  <div class="logs">
-    ${logContent}
+  <div class="logs" id="logs">
+    <span class="log-status" id="status">Loading logs…<span class="cursor"></span></span>
   </div>
 
   <br/>
   <a class="open-btn" href="${deployUrl}" target="_blank">Open Deployment ↗</a>
+
+  <script>
+    const logsEl = document.getElementById('logs');
+    const statusEl = document.getElementById('status');
+    let firstLine = true;
+
+    function escHtml(str) {
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+
+      if (msg.type === 'log') {
+        if (firstLine) {
+          // Remove the loading indicator on first real log line
+          statusEl?.remove();
+          firstLine = false;
+        }
+        const div = document.createElement('div');
+        div.className = 'log-line ' + (
+          msg.logType === 'stderr' || msg.logType === 'error' ? 'log-error' : 'log-normal'
+        );
+        div.textContent = msg.text;
+        logsEl.appendChild(div);
+        // Auto-scroll to bottom
+        logsEl.scrollTop = logsEl.scrollHeight;
+      } else if (msg.type === 'done') {
+        statusEl?.remove();
+        if (firstLine) {
+          const span = document.createElement('span');
+          span.className = 'log-status';
+          span.textContent = 'No build output available.';
+          logsEl.appendChild(span);
+        }
+      } else if (msg.type === 'error') {
+        statusEl?.remove();
+        const span = document.createElement('span');
+        span.className = 'log-line log-error';
+        span.textContent = 'Error fetching logs: ' + msg.text;
+        logsEl.appendChild(span);
+      }
+    });
+  </script>
 </body>
 </html>`;
   }
@@ -256,38 +304,26 @@ export class DeploymentPanel {
 
 function getStateColor(state: string): { bg: string; fg: string } {
   switch (state) {
-    case 'READY':
-      return { bg: '#16a34a', fg: '#fff' };
-    case 'ERROR':
-      return { bg: '#dc2626', fg: '#fff' };
+    case 'READY':      return { bg: '#16a34a', fg: '#fff' };
+    case 'ERROR':      return { bg: '#dc2626', fg: '#fff' };
     case 'BUILDING':
-    case 'INITIALIZING':
-      return { bg: '#2563eb', fg: '#fff' };
-    case 'QUEUED':
-      return { bg: '#6b7280', fg: '#fff' };
-    case 'CANCELED':
-      return { bg: '#9ca3af', fg: '#fff' };
-    default:
-      return { bg: '#6b7280', fg: '#fff' };
+    case 'INITIALIZING': return { bg: '#2563eb', fg: '#fff' };
+    case 'QUEUED':     return { bg: '#6b7280', fg: '#fff' };
+    case 'CANCELED':   return { bg: '#9ca3af', fg: '#fff' };
+    default:           return { bg: '#6b7280', fg: '#fff' };
   }
 }
 
 function getStateLabel(state: string): string {
   const map: Record<string, string> = {
-    READY: 'Ready',
-    ERROR: 'Failed',
-    BUILDING: 'Building',
-    INITIALIZING: 'Initializing',
-    QUEUED: 'Queued',
-    CANCELED: 'Canceled',
+    READY: 'Ready', ERROR: 'Failed', BUILDING: 'Building',
+    INITIALIZING: 'Initializing', QUEUED: 'Queued', CANCELED: 'Canceled',
   };
   return map[state] ?? state;
 }
 
 function formatDuration(seconds: number): string {
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
+  if (seconds < 60) { return `${seconds}s`; }
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}m ${s}s`;

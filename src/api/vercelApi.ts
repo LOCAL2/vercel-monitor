@@ -1,5 +1,5 @@
 import * as https from 'https';
-import { BuildLog, DeploymentState, VercelDeployment } from '../types';
+import { DeploymentState, VercelDeployment } from '../types';
 
 const BASE_URL = 'api.vercel.com';
 
@@ -86,8 +86,15 @@ export async function getLatestDeployment(
   projectId: string,
   teamId?: string
 ): Promise<VercelDeployment | null> {
-  const query = teamId ? `?projectId=${projectId}&teamId=${teamId}&limit=1` : `?projectId=${projectId}&limit=1`;
-  const result = (await httpsGet(`/v6/deployments${query}`, token)) as {
+  const params = new URLSearchParams({
+    projectId,
+    limit: '1',
+    sort: 'created',
+    order: 'desc',
+  });
+  if (teamId) { params.set('teamId', teamId); }
+
+  const result = (await httpsGet(`/v6/deployments?${params.toString()}`, token)) as {
     deployments?: RawDeployment[];
     error?: { message: string };
   };
@@ -121,39 +128,43 @@ export async function getDeployment(
 }
 
 /**
- * Fetch build logs for a deployment.
- * Uses /v3 which accepts either deployment ID (dpl_xxx) or hostname URL.
+ * Stream build logs for a deployment, calling onLine for each log line as it arrives.
+ * Uses /v3 NDJSON streaming endpoint.
  */
-export async function getBuildLogs(
+export function streamBuildLogs(
   token: string,
   deploymentId: string,
   deploymentUrl: string,
-  teamId?: string
-): Promise<BuildLog[]> {
-  // Try uid first; if 404, fall back to the hostname (url field)
-  try {
-    return await fetchBuildLogsById(token, deploymentId, teamId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('404') || msg.includes('not_found')) {
-      return fetchBuildLogsById(token, deploymentUrl, teamId);
+  teamId: string | undefined,
+  onLine: (line: { text: string; logType: string }) => void,
+  onDone: () => void,
+  onError: (message: string) => void
+): Promise<void> {
+  // Try uid first, fall back to hostname url on 404
+  return streamById(token, deploymentId, teamId, onLine, onDone, (err) => {
+    if (err.includes('404') || err.includes('not_found')) {
+      streamById(token, deploymentUrl, teamId, onLine, onDone, onError).catch(() => undefined);
+    } else {
+      onError(err);
     }
-    throw err;
-  }
+  });
 }
 
-async function fetchBuildLogsById(
+function streamById(
   token: string,
   idOrUrl: string,
-  teamId?: string
-): Promise<BuildLog[]> {
-  const query = new URLSearchParams({ direction: 'forward', builds: '1' });
-  if (teamId) { query.set('teamId', teamId); }
+  teamId: string | undefined,
+  onLine: (line: { text: string; logType: string }) => void,
+  onDone: () => void,
+  onError: (message: string) => void
+): Promise<void> {
+  const params = new URLSearchParams({ direction: 'forward', builds: '1' });
+  if (teamId) { params.set('teamId', teamId); }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: BASE_URL,
-      path: `/v3/deployments/${encodeURIComponent(idOrUrl)}/events?${query.toString()}`,
+      path: `/v3/deployments/${encodeURIComponent(idOrUrl)}/events?${params.toString()}`,
       method: 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -162,62 +173,83 @@ async function fetchBuildLogsById(
     };
 
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
+      if (res.statusCode !== 200) {
+        let body = '';
+        res.on('data', (c) => (body += c));
+        res.on('end', () => {
+          onError(`HTTP ${res.statusCode}: ${body.slice(0, 300)}`);
+          resolve();
+        });
+        return;
+      }
+
+      let buffer = '';
+
+      res.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        // Process all complete newline-delimited JSON lines
+        const lines = buffer.split('\n');
+        // Keep last partial line in buffer
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) { continue; }
+          try {
+            const event = JSON.parse(trimmed) as {
+              type?: string;
+              created?: number;
+              payload?: { text?: string; type?: string };
+              text?: string;
+            };
+
+            if (!event || event.type === 'delimiter') { continue; }
+
+            const text = event.payload?.text ?? event.text ?? '';
+            if (!text.trim()) { continue; }
+
+            const logType = event.payload?.type ?? event.type ?? 'stdout';
+            onLine({ text, logType });
+          } catch {
+            // skip malformed line
+          }
+        }
+      });
+
       res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
-          return;
-        }
-
-        try {
-          const lines = data.split('\n').filter((l) => l.trim());
-
-          if (lines.length === 0) {
-            reject(new Error(`Empty response (uid: ${idOrUrl})`));
-            return;
-          }
-
-          const logs: BuildLog[] = [];
-
-          for (const line of lines) {
-            try {
-              const event = JSON.parse(line) as {
-                type?: string;
-                created?: number;
-                payload?: { text?: string; type?: string };
-                text?: string;
-              };
-
-              if (!event || event.type === 'delimiter') { continue; }
-
-              const text = event.payload?.text ?? event.text ?? '';
-              if (!text.trim()) { continue; }
-
-              const logType = (event.payload?.type ?? event.type ?? 'stdout') as BuildLog['type'];
-              logs.push({ text, type: logType, created: event.created ?? 0 });
-            } catch {
-              // skip malformed line
+        // Flush any remaining buffer
+        if (buffer.trim()) {
+          try {
+            const event = JSON.parse(buffer) as {
+              type?: string;
+              payload?: { text?: string; type?: string };
+              text?: string;
+            };
+            const text = event.payload?.text ?? event.text ?? '';
+            if (text.trim()) {
+              onLine({ text, logType: event.payload?.type ?? event.type ?? 'stdout' });
             }
-          }
-
-          if (logs.length === 0) {
-            const sample = lines.slice(0, 3).join(' | ').slice(0, 500);
-            reject(new Error(`Parsed 0 logs from ${lines.length} lines. Sample: ${sample}`));
-            return;
-          }
-
-          resolve(logs);
-        } catch (err) {
-          reject(new Error(`Parse error: ${String(err)}\nRaw: ${data.slice(0, 300)}`));
+          } catch { /* ignore */ }
         }
+        onDone();
+        resolve();
+      });
+
+      res.on('error', (err) => {
+        onError(err.message);
+        resolve();
       });
     });
 
-    req.on('error', reject);
-    req.setTimeout(15000, () => {
+    req.on('error', (err) => {
+      onError(err.message);
+      resolve();
+    });
+
+    req.setTimeout(30_000, () => {
       req.destroy(new Error('Build log request timed out'));
     });
+
     req.end();
   });
 }
